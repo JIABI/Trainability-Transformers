@@ -8,23 +8,6 @@ import torch.nn.functional as F
 
 
 # -----------------------------
-# Residual gate (skip-connection ablation)
-# -----------------------------
-class ResidualAlpha(nn.Module):
-    def __init__(self, fn, alpha: float = 1.0):
-        """
-        Wrap a sub-layer F(x, ...) into: x + alpha * F(x, ...)
-        alpha=1 -> normal residual; alpha=0 -> skip removed.
-        """
-        super().__init__()
-        self.fn = fn
-        self.register_buffer("alpha", torch.tensor(float(alpha)))
-
-    def forward(self, x, *args, **kwargs):
-        return x + self.alpha * self.fn(x, *args, **kwargs)
-
-
-# -----------------------------
 # Stochastic depth
 # -----------------------------
 class DropPath(nn.Module):
@@ -49,6 +32,7 @@ class ConvPatchEmbed(nn.Module):
     Conv embedding with stride for pyramid downsampling.
     img: (B, C_in, H, W) -> tokens (B, HW', C_out), H',W' reduced by stride
     """
+
     def __init__(self, in_chans: int, embed_dim: int, kernel_size: int, stride: int):
         super().__init__()
         pad = kernel_size // 2
@@ -67,17 +51,29 @@ class ConvPatchEmbed(nn.Module):
 # MLP block
 # -----------------------------
 class Mlp(nn.Module):
-    def __init__(self, dim: int, mlp_ratio: float = 4.0, drop: float = 0.0):
+    def __init__(self, dim: int, mlp_ratio: float = 4.0, drop: float = 0.0, act_layer: str = "gelu"):
         super().__init__()
         hidden = int(dim * mlp_ratio)
         self.fc1 = nn.Linear(dim, hidden)
-        self.act = nn.GELU()
+        if act_layer.lower() == "gelu":
+            self.act = nn.GELU()
+        elif act_layer.lower() == "selu":
+            self.act = nn.SELU()
+        elif act_layer.lower() == "relu":
+            self.act = nn.ReLU(inplace=True)
+        elif act_layer.lower() == "silu":
+            self.act = nn.SiLU(inplace=True)
+        else:
+            raise ValueError(f"Unknown activation: {act_layer}")
         self.fc2 = nn.Linear(hidden, dim)
         self.drop = nn.Dropout(drop)
 
     def forward(self, x):
-        x = self.fc1(x); x = self.act(x); x = self.drop(x)
-        x = self.fc2(x); x = self.drop(x)
+        x = self.fc1(x)
+        x = self.act(x)
+        x = self.drop(x)
+        x = self.fc2(x)
+        x = self.drop(x)
         return x
 
 
@@ -86,8 +82,10 @@ class Mlp(nn.Module):
 # -----------------------------
 class ConvAttention(nn.Module):
     """
-    Multi-head attention where q/k/v are produced by depthwise conv on 2D feature maps.
+    Multi-head attention where q/k/v are produced by depthwise conv on 2D feature maps
+    to inject locality (CvT idea). No explicit positional embedding is needed.
     """
+
     def __init__(self, dim: int, num_heads: int, kernel_size: int = 3,
                  qkv_bias: bool = True, attn_drop: float = 0.0, proj_drop: float = 0.0):
         super().__init__()
@@ -97,7 +95,7 @@ class ConvAttention(nn.Module):
         self.head_dim = dim // num_heads
         self.scale = self.head_dim ** -0.5
 
-        # 1x1 pointwise then depthwise conv for locality
+        # 1x1 pointwise to set channels, then depthwise conv to add locality
         self.q_pw = nn.Conv2d(dim, dim, kernel_size=1, bias=qkv_bias)
         self.k_pw = nn.Conv2d(dim, dim, kernel_size=1, bias=qkv_bias)
         self.v_pw = nn.Conv2d(dim, dim, kernel_size=1, bias=qkv_bias)
@@ -141,34 +139,23 @@ class ConvAttention(nn.Module):
 
 
 # -----------------------------
-# Transformer block with ConvAttention (with residual gates)
+# Transformer block with ConvAttention
 # -----------------------------
 class CvTBlock(nn.Module):
     def __init__(self, dim: int, num_heads: int, mlp_ratio: float,
                  attn_kernel: int, qkv_bias: bool, drop: float, attn_drop: float,
-                 drop_path: float,
-                 alpha_attn: float = 1.0, alpha_mlp: float = 1.0):
+                 drop_path: float, act_layer: str = "gelu"):
         super().__init__()
         self.norm1 = nn.LayerNorm(dim)
         self.attn = ConvAttention(dim, num_heads, kernel_size=attn_kernel,
                                   qkv_bias=qkv_bias, attn_drop=attn_drop, proj_drop=drop)
         self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
         self.norm2 = nn.LayerNorm(dim)
-        self.mlp = Mlp(dim, mlp_ratio=mlp_ratio, drop=drop)
-
-        # residual gates wrap whole sub-branches (LN + sublayer + DropPath)
-        self.resid_attn = ResidualAlpha(
-            fn=lambda y, H, W: self.drop_path(self.attn(self.norm1(y), H, W)),
-            alpha=alpha_attn
-        )
-        self.resid_mlp = ResidualAlpha(
-            fn=lambda y: self.drop_path(self.mlp(self.norm2(y))),
-            alpha=alpha_mlp
-        )
+        self.mlp = Mlp(dim, mlp_ratio=mlp_ratio, drop=drop, act_layer=act_layer)
 
     def forward(self, x: torch.Tensor, H: int, W: int) -> torch.Tensor:
-        x = self.resid_attn(x, H, W)  # x + alpha_attn * DropPath(Attn(LN(x)))
-        x = self.resid_mlp(x)         # x + alpha_mlp  * DropPath(MLP(LN(x)))
+        x = x + self.drop_path(self.attn(self.norm1(x), H, W))
+        x = x + self.drop_path(self.mlp(self.norm2(x)))
         return x
 
 
@@ -179,23 +166,22 @@ class CvTStage(nn.Module):
     def __init__(self, in_chans: int, embed_dim: int, depth: int, num_heads: int,
                  stem_kernel: int, stem_stride: int, attn_kernel: int,
                  mlp_ratio: float, qkv_bias: bool, drop: float, attn_drop: float,
-                 drop_path: List[float], disable_downsample: bool = False,
-                 alpha_attn: float = 1.0, alpha_mlp: float = 1.0):
+                 drop_path: List[float], disable_downsample: bool = False, act_layer: str = "gelu"):
         super().__init__()
         # stem (downsample unless disabled)
         stride = 1 if disable_downsample else stem_stride
         self.stem = ConvPatchEmbed(in_chans, embed_dim, kernel_size=stem_kernel, stride=stride)
         self.blocks = nn.ModuleList([
             CvTBlock(embed_dim, num_heads, mlp_ratio, attn_kernel, qkv_bias, drop, attn_drop,
-                     drop_path[i] if isinstance(drop_path, list) else drop_path,
-                     alpha_attn=alpha_attn, alpha_mlp=alpha_mlp)
+                     drop_path[i] if isinstance(drop_path, list) else drop_path, act_layer=act_layer)
             for i in range(depth)
         ])
         self.embed_dim = embed_dim
 
     def forward(self, x: torch.Tensor, H: int, W: int) -> Tuple[torch.Tensor, int, int, int]:
-        # stem expects 4D image tensor (B,C,H,W)
+        # stem always expects 4D image tensor (B,C,H,W)
         if x.ndim == 3:
+            # tokens back to 2D map for the stem (rare path if chained stages)
             B, N, C = x.shape
             x = x.transpose(1, 2).reshape(B, C, H, W)
         x, H, W = self.stem(x)  # (B, H'*W', C)
@@ -205,12 +191,13 @@ class CvTStage(nn.Module):
 
 
 # -----------------------------
-# CvT top-level classifier (with residual gates)
+# CvT top-level classifier
 # -----------------------------
 class CvT(nn.Module):
     """
     3-stage hierarchical CvT classifier (CvT-13 style by default)
     """
+
     def __init__(self,
                  img_size: int = 224,
                  in_chans: int = 3,
@@ -228,9 +215,7 @@ class CvT(nn.Module):
                  drop_path_rate: float = 0.1,
                  global_pool: str = "mean",
                  disable_pyramid: bool = False,
-                 # NEW: residual gates (apply to all blocks)
-                 alpha_attn: float = 1.0,
-                 alpha_mlp: float = 1.0):
+                 act_layer: str = "gelu",):
         super().__init__()
         assert len(embed_dims) == len(depths) == len(num_heads) == 3
         self.num_classes = num_classes
@@ -258,9 +243,8 @@ class CvT(nn.Module):
                 drop=drop_rate,
                 attn_drop=attn_drop_rate,
                 drop_path=dpr[cursor: cursor + depths[i]],
-                disable_downsample=disable_pyramid and i > 0,  # 禁用后两级下采样的选项
-                alpha_attn=alpha_attn,
-                alpha_mlp=alpha_mlp
+                disable_downsample=disable_pyramid and i > 0,  # 仅禁用后两级的下采样
+                act_layer=act_layer
             )
             stages.append(stage)
             cursor += depths[i]
@@ -274,10 +258,13 @@ class CvT(nn.Module):
         # track H,W as we downsample
         H, W = x.shape[-2], x.shape[-1]
         out = x
-        for st in self.stages:
-            out, H, W, C = st(out, H, W)  # out: (B, H'*W', C)
-        out = self.norm(out)             # (B, N, C_last)
-        out = out.mean(dim=1)            # global mean pool over tokens
+        for i, st in enumerate(self.stages):
+            out, H, W, C = st(out, H, W)
+            # 'out' already tokens (B, H*W, C) after stage forward
+            # H,W updated inside
+        out = self.norm(out)  # (B, N, C_last)
+        # global mean pool over tokens
+        out = out.mean(dim=1)
         return out
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -290,9 +277,7 @@ class CvT(nn.Module):
 # Factories
 # -----------------------------
 def cvt_13(img_size=224, num_classes=1000, drop_path_rate=0.1,
-           global_pool="mean", disable_pyramid: bool = False,
-           # NEW: residual gates
-           alpha_attn: float = 1.0, alpha_mlp: float = 1.0):
+           global_pool="mean", disable_pyramid: bool = False, act_layer: str="gelu"):
     """
     CvT-13 style: dims [64,192,384], depths [1,2,10], heads [1,3,6]
     """
@@ -307,18 +292,14 @@ def cvt_13(img_size=224, num_classes=1000, drop_path_rate=0.1,
         mlp_ratio=4.0, qkv_bias=True,
         drop_rate=0.0, attn_drop_rate=0.0, drop_path_rate=drop_path_rate,
         global_pool=global_pool, disable_pyramid=disable_pyramid,
-        alpha_attn=alpha_attn, alpha_mlp=alpha_mlp
+        act_layer=act_layer
     )
 
 
-def cvt_13_nopyramid(img_size=224, num_classes=1000, drop_path_rate=0.1,
-                     global_pool="mean",
-                     # NEW: residual gates
-                     alpha_attn: float = 1.0, alpha_mlp: float = 1.0):
+def cvt_13_nopyramid(img_size=224, num_classes=1000, drop_path_rate=0.1, global_pool="mean", act_layer: str="gelu"):
     """
     Ablation: disable downsampling in later stages (keep token count roughly constant).
     """
     return cvt_13(img_size=img_size, num_classes=num_classes,
                   drop_path_rate=drop_path_rate, global_pool=global_pool,
-                  disable_pyramid=True,
-                  alpha_attn=alpha_attn, alpha_mlp=alpha_mlp)
+                  disable_pyramid=True, act_layer=act_layer)

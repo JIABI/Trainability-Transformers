@@ -1,6 +1,7 @@
+#--models vit swin cvt linformer \
 python train_wo_sc.py \
-  --models vit swin cvt linformer \
-  --ablations mlp_off \
+  --ablations all_on \
+  --models  vit \
   --dataset cifar10 --image_size 224 \
   --epochs 40 --warmup_epochs 3 \
   --batch_size 128 --val_batch_size 256 \

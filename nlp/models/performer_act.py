@@ -1,16 +1,19 @@
+# models/performer_text.py
+
 from __future__ import annotations
 import math
-from typing import Optional, List
-
+from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
 
 # -------- utils ----------
 class DropPath(nn.Module):
     def __init__(self, drop_prob: float = 0.0):
         super().__init__()
         self.drop_prob = float(drop_prob)
+
     def forward(self, x):
         if self.drop_prob == 0.0 or not self.training:
             return x
@@ -19,31 +22,37 @@ class DropPath(nn.Module):
         rnd = x.new_empty(shape).bernoulli_(keep)
         return x * rnd.div(keep)
 
+
+# -------- MLP ----------
 class Mlp(nn.Module):
-    def __init__(self, dim, mlp_ratio=4.0, drop=0.0):
+    def __init__(self, dim, mlp_ratio=4.0, drop=0.0, act_layer: str = "gelu"):
         super().__init__()
         hid = int(dim * mlp_ratio)
         self.fc1 = nn.Linear(dim, hid)
-        self.act = nn.GELU()
+
+        act_layer = act_layer.lower()
+        if act_layer == "gelu":
+            self.act = nn.GELU()
+        elif act_layer == "relu":
+            self.act = nn.ReLU(inplace=True)
+        elif act_layer == "selu":
+            self.act = nn.SELU()
+        elif act_layer == "silu":
+            self.act = nn.SiLU(inplace=True)
+        else:
+            raise ValueError(f"Unsupported activation: {act_layer}")
+
         self.fc2 = nn.Linear(hid, dim)
         self.drop = nn.Dropout(drop)
+
     def forward(self, x):
-        x = self.fc1(x); x = self.act(x); x = self.drop(x)
-        x = self.fc2(x); x = self.drop(x)
+        x = self.fc1(x)
+        x = self.act(x)
+        x = self.drop(x)
+        x = self.fc2(x)
+        x = self.drop(x)
         return x
 
-# -------- Residual gate (for skip connection ablation) ----------
-class ResidualAlpha(nn.Module):
-    """
-    Wrap a sublayer F into: x + alpha * F(x, ...)
-    Set alpha=1.0 -> normal residual; alpha=0.0 -> residual removed (skip off).
-    """
-    def __init__(self, fn, alpha: float = 1.0):
-        super().__init__()
-        self.fn = fn
-        self.register_buffer("alpha", torch.tensor(float(alpha)))
-    def forward(self, x, *args, **kwargs):
-        return x + self.alpha * self.fn(x, *args, **kwargs)
 
 # -------- FAVOR+ random features ----------
 def gaussian_orthogonal_random_matrix(d: int, m: int, device=None, dtype=torch.float32):
@@ -59,6 +68,7 @@ def gaussian_orthogonal_random_matrix(d: int, m: int, device=None, dtype=torch.f
         blocks.append(Q[:, :m_rem])
     return torch.cat(blocks, dim=1)
 
+
 def softmax_feature(x: torch.Tensor, proj: torch.Tensor, eps: float = 1e-6):
     # x: (B,N,H,Dh), proj: (H,Dh,M)
     xw = torch.einsum('bnhd,hdm->bnhm', x, proj)  # (B,N,H,M)
@@ -67,7 +77,8 @@ def softmax_feature(x: torch.Tensor, proj: torch.Tensor, eps: float = 1e-6):
     phi = torch.exp(xw - max_xw) * torch.exp(-x_sq + max_xw) + eps
     return phi
 
-# -------- Performer attention (token sequence) ----------
+
+# -------- Performer attention ----------
 class PerformerAttention(nn.Module):
     def __init__(self, dim: int, num_heads: int = 8, m_features: int = 128,
                  qkv_bias: bool = True, attn_drop: float = 0.0, proj_drop: float = 0.0,
@@ -96,9 +107,8 @@ class PerformerAttention(nn.Module):
         if self.proj_matrix is None or self.proj_matrix.device != device:
             pm = []
             for _ in range(self.num_heads):
-                W = gaussian_orthogonal_random_matrix(
-                    self.head_dim, self.m_features, device=device, dtype=torch.float32
-                )
+                W = gaussian_orthogonal_random_matrix(self.head_dim, self.m_features,
+                                                      device=device, dtype=torch.float32)
                 pm.append(W.unsqueeze(0))
             self.proj_matrix = torch.cat(pm, dim=0)  # (H,Dh,M)
 
@@ -106,16 +116,20 @@ class PerformerAttention(nn.Module):
         B, N, C = x.shape
         self._maybe_init_proj(x.device)
 
-        q = self.q(x); k = self.k(x); v = self.v(x)
-        def split(t): return t.view(B, N, self.num_heads, self.head_dim)
+        q = self.q(x)
+        k = self.k(x)
+        v = self.v(x)
+
+        def split(t):
+            return t.view(B, N, self.num_heads, self.head_dim)
 
         q = split(q) * self.scale
         k = split(k)
         v = split(v)
 
-        # mask: (B,1,1,N) with 0 for padding positions
+        # mask: zero-out padded tokens in K,V
         if attn_mask is not None:
-            m = attn_mask.to(k.dtype)  # broadcastable (B,N,1,1) or (B,1,1,N) depending upstream
+            m = attn_mask.to(k.dtype)
             k = k * m
             v = v * m
 
@@ -123,10 +137,10 @@ class PerformerAttention(nn.Module):
         qf = softmax_feature(q.float(), self.proj_matrix)
         kf = softmax_feature(k.float(), self.proj_matrix)
 
-        kv   = torch.einsum('bnhm,bnhd->bhmd', kf, v.float())   # (B,H,M,Dh)
-        ksum = kf.sum(dim=1)                                    # (B,H,M)
+        kv = torch.einsum('bnhm,bnhd->bhmd', kf, v.float())  # (B,H,M,Dh)
+        ksum = kf.sum(dim=1)  # (B,H,M)
         denom = torch.einsum('bnhm,bhm->bhn', qf, ksum).clamp(min=1e-6).unsqueeze(-1)
-        ctx = torch.einsum('bnhm,bhmd->bhnd', qf, kv) / denom   # (B,H,N,Dh)
+        ctx = torch.einsum('bnhm,bhmd->bhnd', qf, kv) / denom  # (B,H,N,Dh)
 
         out = ctx.transpose(1, 2).contiguous().view(B, N, C)
         out = self.attn_drop(out)
@@ -139,34 +153,25 @@ class PerformerAttention(nn.Module):
                 self.proj_matrix = None
         return out
 
+
 class PerformerBlock(nn.Module):
     def __init__(self, dim, num_heads, m_features, mlp_ratio=4.0, drop=0.0, attn_drop=0.0,
-                 drop_path=0.0, qkv_bias=True, redraw_interval=0,
-                 alpha_attn: float = 1.0, alpha_mlp: float = 1.0):
+                 drop_path=0.0, qkv_bias=True, redraw_interval=0, act_layer: str = "gelu"):
         super().__init__()
         self.norm1 = nn.LayerNorm(dim)
         self.attn = PerformerAttention(dim, num_heads, m_features, qkv_bias,
                                        attn_drop, drop, redraw_interval)
         self.drop_path = DropPath(drop_path) if drop_path > 0 else nn.Identity()
         self.norm2 = nn.LayerNorm(dim)
-        self.mlp = Mlp(dim, mlp_ratio, drop)
-
-        # wrap with residual gates
-        self.resid_attn = ResidualAlpha(
-            fn=lambda y, mask=None: self.drop_path(self.attn(self.norm1(y), mask)),
-            alpha=alpha_attn
-        )
-        self.resid_mlp = ResidualAlpha(
-            fn=lambda y: self.drop_path(self.mlp(self.norm2(y))),
-            alpha=alpha_mlp
-        )
+        self.mlp = Mlp(dim, mlp_ratio, drop, act_layer=act_layer)
 
     def forward(self, x, attn_mask=None):
-        x = self.resid_attn(x, attn_mask)  # x + alpha_attn * DropPath(Attn(LN(x)))
-        x = self.resid_mlp(x)              # x + alpha_mlp  * DropPath(MLP(LN(x)))
+        x = x + self.drop_path(self.attn(self.norm1(x), attn_mask))
+        x = x + self.drop_path(self.mlp(self.norm2(x)))
         return x
 
-# -------- Text Performer encoder + classifier ----------
+
+# -------- Text Performer ----------
 class TextPerformer(nn.Module):
     def __init__(self,
                  vocab_size: int,
@@ -181,13 +186,9 @@ class TextPerformer(nn.Module):
                  attn_drop_rate: float = 0.0,
                  drop_path_rate: float = 0.1,
                  use_cls_token: bool = True,
-                 # NEW: residual gates
-                 alpha_attn: float = 1.0,
-                 alpha_mlp: float = 1.0,
-                 redraw_interval: int = 0):
+                 act_layer: str = "gelu"):
         super().__init__()
         self.use_cls_token = use_cls_token
-
         self.tok = nn.Embedding(vocab_size, embed_dim)
         self.pos = nn.Parameter(torch.zeros(1, max_len + (1 if use_cls_token else 0), embed_dim))
         self.cls = nn.Parameter(torch.zeros(1, 1, embed_dim)) if use_cls_token else None
@@ -199,61 +200,47 @@ class TextPerformer(nn.Module):
         self.blocks = nn.ModuleList([
             PerformerBlock(embed_dim, num_heads, m_features,
                            mlp_ratio=mlp_ratio, drop=drop_rate, attn_drop=attn_drop_rate,
-                           drop_path=dpr[i], qkv_bias=True, redraw_interval=redraw_interval,
-                           alpha_attn=alpha_attn, alpha_mlp=alpha_mlp)
+                           drop_path=dpr[i], qkv_bias=True,
+                           act_layer=act_layer)
             for i in range(depth)
         ])
         self.norm = nn.LayerNorm(embed_dim)
         self.head = nn.Linear(embed_dim, num_classes)
 
     def forward(self, input_ids: torch.Tensor, attention_mask: Optional[torch.Tensor] = None):
-        """
-        input_ids: (B, N) token ids; attention_mask: (B, N) with 1 for real, 0 for pad
-        """
         B, N = input_ids.shape
-        x = self.tok(input_ids)  # (B,N,C)
-
+        x = self.tok(input_ids)
         if self.use_cls_token:
-            cls = self.cls.expand(B, -1, -1)  # (B,1,C)
-            x = torch.cat([cls, x], dim=1)    # (B,N+1,C)
+            cls = self.cls.expand(B, -1, -1)
+            x = torch.cat([cls, x], dim=1)
             pos = self.pos[:, :N + 1, :]
             if attention_mask is not None:
                 attention_mask = torch.cat([attention_mask.new_ones(B, 1), attention_mask], dim=1)
         else:
             pos = self.pos[:, :N, :]
-
         x = x + pos
 
-        attn_mask_feat = None
+        attn_mask_t = None
         if attention_mask is not None:
-            # make it broadcastable for attention: (B,N,1,1)
-            attn_mask_feat = attention_mask[:, :, None, None].to(x.dtype)
+            attn_mask_t = attention_mask[:, :, None, None].to(x.dtype)
 
         for blk in self.blocks:
-            x = blk(x, attn_mask_feat)
+            x = blk(x, attn_mask_t)
 
         x = self.norm(x)
         if self.use_cls_token:
             x = x[:, 0]
         else:
-            # masked average
-            if attention_mask is None:
-                x = x.mean(dim=1)
-            else:
-                x = (x * attention_mask[:, :, None]).sum(dim=1) / (attention_mask.sum(dim=1, keepdim=True) + 1e-6)
+            x = (x * attention_mask[:, :, None]).sum(dim=1) / (attention_mask.sum(dim=1, keepdim=True) + 1e-6)
         return self.head(x)
 
+
+# -------- Factory ----------
 def performer_text_small(vocab_size: int, num_classes: int = 2, max_len: int = 1024,
                          embed_dim=384, depth=8, num_heads=6, m_features=128,
                          mlp_ratio=4.0, drop_rate=0.1, drop_path_rate=0.1,
-                         use_cls_token=True,
-                         # NEW: residual gates
-                         alpha_attn: float = 1.0, alpha_mlp: float = 1.0,
-                         redraw_interval: int = 0):
-    return TextPerformer(
-        vocab_size=vocab_size, num_classes=num_classes, max_len=max_len,
-        embed_dim=embed_dim, depth=depth, num_heads=num_heads, m_features=m_features,
-        mlp_ratio=mlp_ratio, drop_rate=drop_rate, attn_drop_rate=0.0,
-        drop_path_rate=drop_path_rate, use_cls_token=use_cls_token,
-        alpha_attn=alpha_attn, alpha_mlp=alpha_mlp, redraw_interval=redraw_interval
-    )
+                         use_cls_token=True, act_layer: str = "gelu"):
+    return TextPerformer(vocab_size=vocab_size, num_classes=num_classes, max_len=max_len,
+                         embed_dim=embed_dim, depth=depth, num_heads=num_heads, m_features=m_features,
+                         mlp_ratio=mlp_ratio, drop_rate=drop_rate, drop_path_rate=drop_path_rate,
+                         use_cls_token=use_cls_token, act_layer=act_layer)

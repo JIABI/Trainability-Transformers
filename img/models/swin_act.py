@@ -7,105 +7,6 @@ from typing import List, Optional, Tuple
 
 
 # -----------------------------
-# Residual gate for skip ablation
-# -----------------------------
-class ResidualAlpha(nn.Module):
-    def __init__(self, fn, alpha: float = 1.0):
-        """
-        Wrap a sub-layer F(*args) into x + alpha * F(x, *extra_args).
-        alpha=1 -> normal residual; alpha=0 -> skip removed.
-        """
-        super().__init__()
-        self.fn = fn
-        self.register_buffer("alpha", torch.tensor(float(alpha)))
-
-    def forward(self, x, *args, **kwargs):
-        return x + self.alpha * self.fn(x, *args, **kwargs)
-
-
-class LearnedPSkip(nn.Module):
-    def __init__(self, dim: int, p_dim: int):
-        super().__init__()
-        self.p = nn.Parameter(torch.zeros(p_dim))  # (p_dim,)
-        nn.init.trunc_normal_(self.p, std=0.02)
-        self.up = nn.Linear(p_dim, dim, bias=False)
-
-    def forward(self, x):  # x: (B, L, C)
-        B, L, C = x.shape
-        p_full = self.up(self.p).view(1, 1, C)  # (1,1,C)
-        return p_full.expand(B, L, C)
-
-
-class PooledPSkip(nn.Module):
-    def __init__(self, dim: int, p_dim: int, init_gamma: float = 0.1):
-        """
-        Global pooled skip connection:
-        p = projection([mean(x), max(x)])   -> (B, p_dim)
-        expand back to (B,L,C), then gate with x.
-
-        Args:
-            dim (int): 输入特征维度
-            p_dim (int): 摘要向量的瓶颈维度
-            init_gamma (float): 初始门控值 (0~1)，越小表示更依赖原始 x
-        """
-        super().__init__()
-        # 这里输入是 mean+max 拼接，所以是 2*dim
-        self.down = nn.Linear(2 * dim, p_dim, bias=False)
-        self.up = nn.Linear(p_dim, dim, bias=False)
-
-        # 门控参数 gamma，可学习
-        self.gamma = nn.Parameter(torch.tensor(init_gamma))
-
-    def forward(self, x):  # x: (B, L, C)
-        B, L, C = x.shape
-
-        # mean pooling & max pooling
-        p_mean = x.mean(dim=1)  # (B, C)
-        p_max = x.max(dim=1).values  # (B, C)
-        p_cat = torch.cat([p_mean, p_max], dim=-1)  # (B, 2C)
-
-        # 下采样再上采样
-        p = self.up(self.down(p_cat))  # (B, C)
-
-        # 扩展到 (B,L,C)
-        p_expand = p.unsqueeze(1).expand(B, L, C)
-
-        # 门控融合： (1-γ)*x + γ*p
-        out = (1 - torch.sigmoid(self.gamma)) * x + torch.sigmoid(self.gamma) * p_expand
-        return out
-
-
-class LowRankSkip(nn.Module):
-    def __init__(self, dim: int, rank_ratio: float = 0.25):
-        super().__init__()
-        rank = max(1, int(dim * rank_ratio))  # 根据 dim 动态确定 rank
-        self.v = nn.Linear(dim, rank, bias=False)
-        self.u = nn.Linear(rank, dim, bias=False)
-
-    def forward(self, x):  # x: (B, L, C)
-        return self.u(self.v(x))  # (B, L, C)
-
-class ResidualBeta(nn.Module):
-    def __init__(self, fn, Beta: float = 1.0, skip_fn: Optional[nn.Module] = None):
-        """
-        Generalized residual wrapper:
-        output = skip_fn(x) + Beta * fn(x, *extra_args)
-
-        - fn: the main branch F
-        - alpha: scalar gate
-        - skip_fn: defines skip connection (default: Identity = x)
-        """
-        super().__init__()
-        self.fn = fn
-        self.register_buffer("Beta", torch.tensor(float(Beta)))
-        self.skip_fn = skip_fn if skip_fn is not None else nn.Identity()
-
-    def forward(self, x, *args, **kwargs):
-        skip_out = self.skip_fn(x)  # could be x, low-rank(x), pooled(x), or LearnedPSkip(x)
-        return skip_out + self.Beta * self.fn(x, *args, **kwargs)
-
-
-# -----------------------------
 # Utils: DropPath (stochastic depth)
 # -----------------------------
 class DropPath(nn.Module):
@@ -127,6 +28,7 @@ class DropPath(nn.Module):
 # -----------------------------
 class PatchEmbed(nn.Module):
     """Image to patch embedding via Conv2d"""
+
     def __init__(self, img_size=224, patch_size=4, in_chans=3, embed_dim=96):
         super().__init__()
         self.proj = nn.Conv2d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size)
@@ -256,30 +158,46 @@ class WindowAttention(nn.Module):
 # MLP
 # -----------------------------
 class Mlp(nn.Module):
-    def __init__(self, in_features, hidden_features=None, out_features=None, drop=0.):
+    def __init__(self, in_features, hidden_features=None, out_features=None,
+                 drop=0., act_layer: str = "gelu"):
         super().__init__()
         out_features = out_features or in_features
         hidden_features = hidden_features or in_features * 4
         self.fc1 = nn.Linear(in_features, hidden_features)
-        self.act = nn.GELU()
+
+        # ===== 支持不同激活函数 =====
+        if act_layer.lower() == "gelu":
+            self.act = nn.GELU()
+        elif act_layer.lower() == "selu":
+            self.act = nn.SELU()
+        elif act_layer.lower() == "relu":
+            self.act = nn.ReLU(inplace=True)
+        elif act_layer.lower() == "silu":
+            self.act = nn.SiLU(inplace=True)
+        else:
+            raise ValueError(f"Unknown activation: {act_layer}")
+
         self.fc2 = nn.Linear(hidden_features, out_features)
         self.drop = nn.Dropout(drop)
 
     def forward(self, x):
-        x = self.fc1(x); x = self.act(x); x = self.drop(x)
-        x = self.fc2(x); x = self.drop(x)
+        x = self.fc1(x)
+        x = self.act(x)
+        x = self.drop(x)
+        x = self.fc2(x)
+        x = self.drop(x)
         return x
 
 
 # -----------------------------
-# Swin Block (with shift) — residual gates added
+# Swin Block (with shift)
 # -----------------------------
 class SwinBlock(nn.Module):
     def __init__(self, dim, input_resolution: Tuple[int, int],
                  num_heads, window_size=7, shift_size=0,
                  mlp_ratio=4., qkv_bias=True,
                  drop=0., attn_drop=0., drop_path=0.,
-                 alpha_attn: float = 1.0, alpha_mlp: float = 1.0):
+                 act_layer: str = "gelu"):  # <<< 新增 act_layer
         super().__init__()
         self.dim = dim
         self.input_resolution = input_resolution
@@ -292,22 +210,10 @@ class SwinBlock(nn.Module):
                                     qkv_bias=qkv_bias, attn_drop=attn_drop, proj_drop=drop)
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
         self.norm2 = nn.LayerNorm(dim)
-        self.mlp = Mlp(dim, int(dim * mlp_ratio), drop=drop)
-
+        # <<< 这里把 act_layer 传进去
+        self.mlp = Mlp(dim, int(dim * mlp_ratio), drop=drop, act_layer=act_layer)
         self.register_buffer("attn_mask", None, persistent=False)
-        r = 0.5
 
-        # ---- residual gates: wrap the whole sub-branches (LN + sublayer + DropPath) ----
-        #self.resid_attn = ResidualAlpha(self._attn_branch, alpha=alpha_attn)
-        #self.resid_mlp  = ResidualAlpha(lambda y: self.drop_path(self.mlp(self.norm2(y))), alpha=alpha_mlp)
-        self.resid_attn = ResidualBeta(
-            self._attn_branch, Beta=alpha_attn, skip_fn=LearnedPSkip(dim, p_dim=dim)
-        )
-        self.resid_mlp = ResidualBeta(
-            lambda y: self.drop_path(self.mlp(self.norm2(y))), Beta=alpha_mlp, skip_fn=LearnedPSkip(dim, p_dim=dim)
-        )
-
-    # build attention mask when needed
     def build_attn_mask(self, H: int, W: int, device):
         if self.shift_size == 0:
             self.attn_mask = None
@@ -326,30 +232,29 @@ class SwinBlock(nn.Module):
         attn_mask = attn_mask.masked_fill(attn_mask != 0, float(-100.0)).masked_fill(attn_mask == 0, 0.0)
         self.attn_mask = attn_mask  # (num_windows, N, N)
 
-    # the attention sub-branch F_attn(x; H,W) without residual, with LN+DropPath inside
-    def _attn_branch(self, x: torch.Tensor, H: int, W: int) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, H: int, W: int) -> torch.Tensor:
         """
-        Return the attention branch output to be added on top of input x.
-        This includes LN -> (shift + window attn + reverse + depad) -> DropPath.
+        x: (B, H*W, C)
         """
         B, L, C = x.shape
         assert L == H * W, "input feature has wrong size"
-        x_norm = self.norm1(x)
-        x_view = x_norm.view(B, H, W, C)
+        shortcut = x
+        x = self.norm1(x)
+        x = x.view(B, H, W, C)
 
         ws = self.window_size
         # pad if needed
         pad_b = (ws - H % ws) % ws
         pad_r = (ws - W % ws) % ws
-        x_view = F.pad(x_view, (0, 0, 0, pad_r, 0, pad_b))  # (B, H', W', C)
-        Hp, Wp = x_view.shape[1], x_view.shape[2]
+        x = F.pad(x, (0, 0, 0, pad_r, 0, pad_b))  # (B, H', W', C)
+        Hp, Wp = x.shape[1], x.shape[2]
 
         # cyclic shift
         if self.shift_size > 0:
-            x_view = torch.roll(x_view, shifts=(-self.shift_size, -self.shift_size), dims=(1, 2))
+            x = torch.roll(x, shifts=(-self.shift_size, -self.shift_size), dims=(1, 2))
 
         # windows
-        x_windows = window_partition(x_view, ws).view(-1, ws * ws, C)
+        x_windows = window_partition(x, ws).view(-1, ws * ws, C)
 
         # mask
         if self.attn_mask is None or self.attn_mask.shape[0] != x_windows.shape[0]:
@@ -357,211 +262,321 @@ class SwinBlock(nn.Module):
         attn_windows = self.attn(x_windows, mask=self.attn_mask)
 
         # merge windows
-        x_merge = attn_windows.view(-1, ws, ws, C)
-        x_merge = window_reverse(x_merge, ws, Hp, Wp)  # (B, Hp, Wp, C)
+        x = attn_windows.view(-1, ws, ws, C)
+        x = window_reverse(x, ws, Hp, Wp)  # (B, Hp, Wp, C)
 
         # reverse cyclic shift
         if self.shift_size > 0:
-            x_merge = torch.roll(x_merge, shifts=(self.shift_size, self.shift_size), dims=(1, 2))
+            x = torch.roll(x, shifts=(self.shift_size, self.shift_size), dims=(1, 2))
 
         # remove padding
         if pad_b > 0 or pad_r > 0:
-            x_merge = x_merge[:, :H, :W, :].contiguous()
+            x = x[:, :H, :W, :].contiguous()
 
-        x_out = x_merge.view(B, H * W, C)
-        return self.drop_path(x_out)
-
-    def forward(self, x: torch.Tensor, H: int, W: int) -> torch.Tensor:
-        """
-        x: (B, H*W, C)
-        """
-        # residual-gated attention
-        x = self.resid_attn(x, H, W)
-        # residual-gated MLP
-        x = self.resid_mlp(x)
+        x = x.view(B, H * W, C)
+        x = shortcut + self.drop_path(x)
+        x = x + self.drop_path(self.mlp(self.norm2(x)))
         return x
 
 
 # -----------------------------
+
 # Patch Merging (downsample H,W by 2; dim x2)
+
 # -----------------------------
+
 class PatchMerging(nn.Module):
+
     def __init__(self, input_resolution: Tuple[int, int], dim: int):
         super().__init__()
+
         self.input_resolution = input_resolution
+
         self.dim = dim
+
         self.reduction = nn.Linear(4 * dim, 2 * dim, bias=False)
+
         self.norm = nn.LayerNorm(4 * dim)
 
     def forward(self, x: torch.Tensor, H: int, W: int) -> Tuple[torch.Tensor, int, int]:
         B, L, C = x.shape
+
         assert L == H * W, "input has wrong size"
+
         x = x.view(B, H, W, C)
 
         # pad if odd
+
         pad_b = H % 2
+
         pad_r = W % 2
+
         if pad_b or pad_r:
             x = F.pad(x, (0, 0, 0, pad_r, 0, pad_b))  # (B, H', W', C)
-            H = x.shape[1]; W = x.shape[2]
+
+            H = x.shape[1];
+            W = x.shape[2]
 
         x0 = x[:, 0::2, 0::2, :]
+
         x1 = x[:, 1::2, 0::2, :]
+
         x2 = x[:, 0::2, 1::2, :]
+
         x3 = x[:, 1::2, 1::2, :]
+
         x = torch.cat([x0, x1, x2, x3], dim=-1)  # (B, H/2, W/2, 4C)
+
         x = x.view(B, -1, 4 * C)
+
         x = self.norm(x)
+
         x = self.reduction(x)  # (B, H/2*W/2, 2C)
+
         H, W = H // 2, W // 2
+
         return x, H, W
 
 
 # -----------------------------
+
 # Stage: multiple SwinBlocks + optional merging
+
 # -----------------------------
+
 class SwinStage(nn.Module):
+
     def __init__(self, dim, depth, input_resolution, num_heads, window_size,
-                 mlp_ratio, qkv_bias, drop, attn_drop, drop_path, downsample: bool,
-                 alpha_attn: float = 1.0, alpha_mlp: float = 1.0):
+
+                 mlp_ratio, qkv_bias, drop, attn_drop, drop_path, downsample: bool, act_layer: str="gelu"):
+
         super().__init__()
+
         self.blocks = nn.ModuleList()
+
         for i in range(depth):
             self.blocks.append(SwinBlock(
+
                 dim=dim, input_resolution=input_resolution,
+
                 num_heads=num_heads, window_size=window_size,
+
                 shift_size=0 if (i % 2 == 0) else window_size // 2,
+
                 mlp_ratio=mlp_ratio, qkv_bias=qkv_bias,
-                drop=drop, attn_drop=attn_drop,
-                drop_path=drop_path[i] if isinstance(drop_path, list) else drop_path,
-                alpha_attn=alpha_attn, alpha_mlp=alpha_mlp
+
+                drop=drop, attn_drop=attn_drop, drop_path=drop_path[i] if isinstance(drop_path, list) else drop_path,
+                act_layer=act_layer
             ))
+
         self.down = PatchMerging(input_resolution, dim) if downsample else None
+
         self.downsample = downsample
+
         self.input_resolution = input_resolution
+
         self.dim = dim
 
     def forward(self, x: torch.Tensor, H: int, W: int) -> Tuple[torch.Tensor, int, int, int]:
+
         for blk in self.blocks:
             x = blk(x, H, W)
+
         out_dim = self.dim
+
         if self.down is not None:
             x, H, W = self.down(x, H, W)
+
             out_dim = self.dim * 2
+
         return x, H, W, out_dim
 
 
 # -----------------------------
+
 # Swin Transformer (Classifier)
+
 # -----------------------------
+
 class SwinTransformer(nn.Module):
+
     def __init__(self,
+
                  img_size=224, patch_size=4, in_chans=3, num_classes=1000,
+
                  embed_dim=96, depths: List[int] = [2, 2, 6, 2],
+
                  num_heads: List[int] = [3, 6, 12, 24],
+
                  window_size=7, mlp_ratio=4., qkv_bias=True,
+
                  drop_rate=0., attn_drop_rate=0., drop_path_rate=0.1,
+
                  global_pool: str = "mean",
+
                  disable_patch_merging: bool = False,
-                 # 新增：残差门控（对整网统一设置）
-                 alpha_attn: float = 1.0,
-                 alpha_mlp: float = 1.0):
+                 act_layer: str="gelu"):
+
         super().__init__()
+
         self.num_classes = num_classes
+
         self.num_layers = len(depths)
+
         self.embed_dim = embed_dim
+
         self.global_pool = global_pool
 
         self.patch_embed = PatchEmbed(img_size, patch_size, in_chans, embed_dim)
 
         # stochastic depth decay rule
+
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, sum(depths))]
 
         # stages
+
         self.stages = nn.ModuleList()
+
         H = W = None  # dynamic from input
+
         dims = []
+
         in_dim = embed_dim
+
         cursor = 0
+
         for i in range(self.num_layers):
             depth_i = depths[i]
+
             heads_i = num_heads[i]
+
             downsample = (i < self.num_layers - 1) and (not disable_patch_merging)
+
+            # input resolution is dynamic; we store placeholder, blocks build masks on first forward
+
             stage = SwinStage(
-                dim=in_dim, depth=depth_i, input_resolution=(0, 0),  # placeholder
+
+                dim=in_dim, depth=depth_i, input_resolution=(0, 0),  # (0,0) placeholder
+
                 num_heads=heads_i, window_size=window_size,
+
                 mlp_ratio=mlp_ratio, qkv_bias=qkv_bias,
+
                 drop=drop_rate, attn_drop=attn_drop_rate,
-                drop_path=dpr[cursor: cursor + depth_i],
-                downsample=downsample,
-                alpha_attn=alpha_attn, alpha_mlp=alpha_mlp
+
+                drop_path=dpr[cursor: cursor + depth_i], downsample=downsample, act_layer=act_layer
+
             )
+
             self.stages.append(stage)
+
             dims.append(in_dim)
+
             cursor += depth_i
+
             in_dim = in_dim * 2 if downsample else in_dim  # update for next stage
 
         self.norm = nn.LayerNorm(in_dim)
+
         self.head = nn.Linear(in_dim, num_classes) if num_classes > 0 else nn.Identity()
 
     def forward_features(self, x: torch.Tensor) -> torch.Tensor:
+
         x, H, W = self.patch_embed(x)  # (B, L, C0), H,W after patch stem
 
         # update stages' input_resolution lazily on first forward
+
         for st in self.stages:
+
+            # set resolution placeholders if needed
+
             if st.blocks and (st.blocks[0].input_resolution == (0, 0)):
+
                 for blk in st.blocks:
                     blk.input_resolution = (H, W)
+
             x, H, W, out_dim = st(x, H, W)
 
         x = self.norm(x)  # (B, L_last, C_last)
 
         # global pooling (no cls token)
-        x = x.mean(dim=1)
+
+        if self.global_pool in ("mean", "gap", "avg", "avgpool", "cls"):  # 'cls' mapped to mean
+
+            x = x.mean(dim=1)
+
+        else:
+
+            x = x.mean(dim=1)
+
         return x
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+
         x = self.forward_features(x)
+
         x = self.head(x)
+
         return x
 
 
 # -----------------------------
+
 # Factory functions
+
 # -----------------------------
+
 def swin_tiny(img_size=224, num_classes=1000, window_size=7,
+
               drop_path_rate=0.1, global_pool="mean",
-              disable_patch_merging: bool = False,
-              # 新增：残差门控
-              alpha_attn: float = 1.0,
-              alpha_mlp: float = 1.0):
+
+              disable_patch_merging: bool = False, act_layer: str="gelu"):
     """
+
     Swin-Tiny default: embed_dim=96, depths=[2,2,6,2], heads=[3,6,12,24], patch_size=4
+
     """
+
     return SwinTransformer(
+
         img_size=img_size, patch_size=4, in_chans=3, num_classes=num_classes,
+
         embed_dim=96, depths=[2, 2, 6, 2], num_heads=[3, 6, 12, 24],
+
         window_size=window_size, mlp_ratio=4.0, qkv_bias=True,
+
         drop_rate=0.0, attn_drop_rate=0.0, drop_path_rate=drop_path_rate,
+
         global_pool=global_pool, disable_patch_merging=disable_patch_merging,
-        alpha_attn=alpha_attn, alpha_mlp=alpha_mlp
+        act_layer=act_layer
+
     )
 
 
 def swin_tiny_nomerge(img_size=224, num_classes=1000, window_size=7,
-                      drop_path_rate=0.1, global_pool="mean",
-                      # 新增：残差门控
-                      alpha_attn: float = 1.0,
-                      alpha_mlp: float = 1.0):
+
+                      drop_path_rate=0.1, global_pool="mean", act_layer: str="gelu"):
     """
+
     Ablation: same channels across stages (no patch merging).
-    Uses the same block depths as Swin-T. Heads adjusted for constant dim.
+
+    Uses the same block depths as Swin-T.
+
     """
+
+    # We emulate "no merging" by disabling it; dims stay at 96 across stages.
+
     return SwinTransformer(
+
         img_size=img_size, patch_size=4, in_chans=3, num_classes=num_classes,
-        embed_dim=96, depths=[2, 2, 6, 2], num_heads=[3, 3, 3, 3],
+
+        embed_dim=96, depths=[2, 2, 6, 2], num_heads=[3, 3, 3, 3],  # heads adjusted for constant dim
+
         window_size=window_size, mlp_ratio=4.0, qkv_bias=True,
+
         drop_rate=0.0, attn_drop_rate=0.0, drop_path_rate=drop_path_rate,
+
         global_pool=global_pool, disable_patch_merging=True,
-        alpha_attn=alpha_attn, alpha_mlp=alpha_mlp
+        act_layer=act_layer
+
     )

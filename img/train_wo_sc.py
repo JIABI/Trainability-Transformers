@@ -85,6 +85,8 @@ def ablation_to_alphas(ablation: str):
         return 1.0, 0.0, "wo_mlpsc"
     elif ablation == "all_off":
         return 0.0, 0.0, "wo_allsc"
+    elif ablation == "all_on":
+        return 1.0, 1.0, "all_sc"
     else:
         raise ValueError("ablation must be one of: attn_off, mlp_off, all_off")
 
@@ -204,7 +206,7 @@ def run_single_experiment(args, model_name: str, ablation: str,
 
     out_dir = os.path.join(save_root, model_name, suffix)
     os.makedirs(out_dir, exist_ok=True)
-    best_path = os.path.join(out_dir, f"{model_name}_{suffix}.pt")
+    best_path = os.path.join(out_dir, f"{model_name}_{suffix}_LearnedPSkip.pt")
 
     best_metric = -1e9
     for epoch in range(args.epochs):
@@ -238,7 +240,7 @@ def main():
     parser.add_argument("--models", type=str, nargs="+", required=True,
                         choices=["vit","swin","cvt","linformer"])
     parser.add_argument("--ablations", type=str, nargs="+", required=True,
-                        choices=["attn_off","mlp_off","all_off"])
+                        choices=["attn_off","mlp_off","all_off", "all_on"])
 
     # model knobs
     parser.add_argument("--patch_size", type=int, default=16)
@@ -265,7 +267,7 @@ def main():
     # misc
     parser.add_argument("--save_dir", type=str, default="runs_ablate")
     parser.add_argument("--zero_drop_path_when_ablate", action="store_true",
-                        help="在做任意消融(attn_off/mlp_off/all_off)时，把 drop-path 设为 0，更稳")
+                        help="在做任意消融(attn_off/mlp_off/all_off/all_on)时，把 drop-path 设为 0，更稳")
 
     args = parser.parse_args()
 

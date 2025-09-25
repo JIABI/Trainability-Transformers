@@ -6,13 +6,15 @@ from transformers import AutoTokenizer
 from tqdm import tqdm
 
 # ====== models (make sure paths match your repo) ======
-from models.performer_wo_sc import performer_text_small
-from models.reformer_wo_sc import reformer_text_small
+from models.performer_act import performer_text_small
+from models.reformer_act import reformer_text_small
 
 
 def set_seed(s=42):
-    random.seed(s); np.random.seed(s)
-    torch.manual_seed(s); torch.cuda.manual_seed_all(s)
+    random.seed(s);
+    np.random.seed(s)
+    torch.manual_seed(s);
+    torch.cuda.manual_seed_all(s)
 
 
 class IMDBDataset(torch.utils.data.Dataset):
@@ -60,23 +62,24 @@ def map_ablation(ablation: str):
     elif ablation == "all_on":
         return 1.0, 1.0, "all_on"
     else:
-        raise ValueError("ablation must be one of: attn_off, mlp_off, all_off", "all_on")
+        raise ValueError("ablation must be one of: attn_off, mlp_off, all_off, all_on")
 
 
 def build_model(
-    model_name: str,
-    vocab_size: int,
-    num_classes: int,
-    max_len: int,
-    embed_dim: int,
-    depth: int,
-    heads: int,
-    m_features: int,
-    bucket_size: int,
-    n_hashes: int,
-    drop_rate: float,
-    drop_path_rate: float,
-    ablation: str,
+        model_name: str,
+        vocab_size: int,
+        num_classes: int,
+        max_len: int,
+        embed_dim: int,
+        depth: int,
+        heads: int,
+        m_features: int,
+        bucket_size: int,
+        n_hashes: int,
+        drop_rate: float,
+        drop_path_rate: float,
+        ablation: str,
+        act_layer: str,
 ):
     alpha_attn, alpha_mlp, suffix = map_ablation(ablation)
 
@@ -87,16 +90,16 @@ def build_model(
         model = performer_text_small(
             vocab_size=vocab_size, num_classes=num_classes, max_len=max_len,
             embed_dim=embed_dim, depth=depth, num_heads=heads, m_features=m_features,
-            mlp_ratio=4.0, drop_rate=drop_rate, drop_path_rate=dp_rate, use_cls_token=True,
-            alpha_attn=alpha_attn, alpha_mlp=alpha_mlp,
+            mlp_ratio=4.0, drop_rate=drop_rate, drop_path_rate=dp_rate,
+            use_cls_token=True, act_layer=act_layer,
         )
     elif model_name == "reformer":
         model = reformer_text_small(
             vocab_size=vocab_size, num_classes=num_classes, max_len=max_len,
             embed_dim=embed_dim, depth=depth, num_heads=heads,
             bucket_size=bucket_size, n_hashes=n_hashes,
-            mlp_ratio=4.0, drop_rate=drop_rate, drop_path_rate=dp_rate, use_cls_token=True,
-            alpha_attn=alpha_attn, alpha_mlp=alpha_mlp,
+            mlp_ratio=4.0, drop_rate=drop_rate, drop_path_rate=dp_rate,
+            use_cls_token=True, act_layer=act_layer,
         )
     else:
         raise ValueError("model must be performer or reformer")
@@ -107,7 +110,9 @@ def build_model(
 # ---------------- Train / Eval ----------------
 def train_one_epoch(model, loader, optimizer, scaler, device, loss_fn, autocast_ctx):
     model.train()
-    running = 0.0; correct = 0; total = 0
+    running = 0.0;
+    correct = 0;
+    total = 0
     pbar = tqdm(loader, desc="Train", dynamic_ncols=True)
     for input_ids, attn_mask, labels in pbar:
         input_ids = input_ids.to(device, non_blocking=True)
@@ -119,7 +124,8 @@ def train_one_epoch(model, loader, optimizer, scaler, device, loss_fn, autocast_
             logits = model(input_ids, attn_mask)
             loss = loss_fn(logits, labels)
         scaler.scale(loss).backward()
-        scaler.step(optimizer); scaler.update()
+        scaler.step(optimizer);
+        scaler.update()
 
         running += float(loss.item()) * input_ids.size(0)
         pred = logits.argmax(dim=1)
@@ -132,7 +138,8 @@ def train_one_epoch(model, loader, optimizer, scaler, device, loss_fn, autocast_
 @torch.no_grad()
 def evaluate(model, loader, device, autocast_ctx):
     model.eval()
-    correct = 0; total = 0
+    correct = 0;
+    total = 0
     for input_ids, attn_mask, labels in tqdm(loader, desc="Eval", dynamic_ncols=True):
         input_ids = input_ids.to(device, non_blocking=True)
         attn_mask = attn_mask.to(device, non_blocking=True)
@@ -148,7 +155,7 @@ def evaluate(model, loader, device, autocast_ctx):
 def run_single(args, model_name, ablation, tokenizer, device):
     # data
     train_loader = get_loader(tokenizer, "train", args.max_len, args.batch_size, args.num_workers)
-    test_loader  = get_loader(tokenizer, "test",  args.max_len, args.batch_size * 2, args.num_workers)
+    test_loader = get_loader(tokenizer, "test", args.max_len, args.batch_size * 2, args.num_workers)
 
     # model
     model, suffix = build_model(
@@ -165,6 +172,7 @@ def run_single(args, model_name, ablation, tokenizer, device):
         drop_rate=args.drop_rate,
         drop_path_rate=args.drop_path_rate,
         ablation=ablation,
+        act_layer=args.act_layer,
     )
     model = model.to(device)
 
@@ -178,15 +186,16 @@ def run_single(args, model_name, ablation, tokenizer, device):
     autocast_ctx = torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp)
 
     # saving
-    out_dir = os.path.join(args.save_dir, model_name, suffix)
+    out_dir = os.path.join("run_act", args.save_dir, model_name, suffix, args.act_layer)
     os.makedirs(out_dir, exist_ok=True)
-    best_path = os.path.join(out_dir, f"{model_name}_{suffix}.pt")
+    best_path = os.path.join(out_dir, f"{model_name}_{suffix}_{args.act_layer}.pt")
 
     best = 0.0
     for epoch in range(1, args.epochs + 1):
         tr_loss = train_one_epoch(model, train_loader, opt, scaler, device, loss_fn, autocast_ctx)
         acc = evaluate(model, test_loader, device, autocast_ctx)
-        print(f"[{model_name}/{suffix}] Epoch {epoch}/{args.epochs} | train_loss={tr_loss:.4f} | test_acc={acc:.4f}")
+        print(f"[{model_name}/{suffix}/{args.act_layer}] Epoch {epoch}/{args.epochs} | "
+              f"train_loss={tr_loss:.4f} | test_acc={acc:.4f}")
         if acc > best:
             best = acc
             torch.save(
@@ -220,14 +229,17 @@ def main():
     ap.add_argument("--embed_dim", type=int, default=384)
     ap.add_argument("--depth", type=int, default=8)
     ap.add_argument("--heads", type=int, default=6)
-    ap.add_argument("--m_features", type=int, default=128)     # Performer
-    ap.add_argument("--bucket_size", type=int, default=64)     # Reformer
-    ap.add_argument("--n_hashes", type=int, default=1)         # Reformer
+    ap.add_argument("--m_features", type=int, default=128)  # Performer
+    ap.add_argument("--bucket_size", type=int, default=64)  # Reformer
+    ap.add_argument("--n_hashes", type=int, default=1)  # Reformer
     ap.add_argument("--drop_rate", type=float, default=0.1)
     ap.add_argument("--drop_path_rate", type=float, default=0.1)
 
     # AMP
     ap.add_argument("--amp_dtype", type=str, default="bf16", choices=["bf16", "fp16", "fp32"])
+
+    # NEW: activation
+    ap.add_argument("--act_layer", type=str, default="gelu", choices=["gelu", "relu", "selu", "silu"])
 
     args = ap.parse_args()
     set_seed(args.seed)
@@ -235,10 +247,7 @@ def main():
 
     tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased", use_fast=True)
 
-    # 如果你想固定顺序，也可以用下面这行；默认就按传入顺序循环
-    # ablations_ordered = [a for a in ["attn_off", "mlp_off", "all_off"] if a in args.ablations]
     ablations_ordered = args.ablations
-
     for model_name in args.models:
         for ablation in ablations_ordered:
             run_single(args, model_name, ablation, tokenizer, device)
